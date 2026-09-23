@@ -109,7 +109,6 @@ def build_trusted_provider_adapter_registry(
             raise ValueError("provider_adapter_profile_invalid") from error
         adapter = _adapter_for_profile(
             profile,
-            provider_model_id=record.provider_model_id,
             settings=settings,
         )
         registry.register_catalog_model(record, adapter)
@@ -120,12 +119,12 @@ def build_trusted_provider_adapter_registry(
 def _adapter_for_profile(
     profile: ProviderAdapterProfileV1,
     *,
-    provider_model_id: str,
     settings: Settings | None,
 ) -> ProviderAdapter:
     from app.services.provider_native_adapters import (
         ArkMediaAdapter,
         MiniMaxVideoAdapter,
+        MiniMaxVideoTransport,
         OpenRouterImageAdapter,
         OpenRouterImageTransport,
     )
@@ -135,7 +134,10 @@ def _adapter_for_profile(
             transport=OpenRouterImageTransport(settings) if settings is not None else None
         )
     if profile.transport_kind == "minimax_video_native":
-        return MiniMaxVideoAdapter(provider_model_id=provider_model_id)
+        return MiniMaxVideoAdapter(
+            profile,
+            transport=MiniMaxVideoTransport(settings) if settings is not None else None,
+        )
     if profile.transport_kind in {"ark_image_native", "ark_video_native"}:
         return ArkMediaAdapter(profile)
     raise ValueError("provider_adapter_profile_invalid")

@@ -1364,10 +1364,13 @@ class V2ProviderExecutor:
             error_code = str(error)
             if error_code not in _NATIVE_PROVIDER_ERROR_CODES:
                 error_code = "provider_generation_failed"
+            gateway_message, provider_error = _gateway_error_passthrough(error)
             return _native_provider_failure(
                 media_type=media_type,
                 provider_payload=provider_payload,
                 error_code=error_code,
+                error_message=gateway_message,
+                provider_error=provider_error,
                 reference_asset_ids=reference_asset_ids,
             )
         except Exception as error:  # noqa: BLE001 - native transport failures become results.
@@ -1431,10 +1434,13 @@ class V2ProviderExecutor:
             normalized_state = status.state.strip().lower()
             if normalized_state not in {"completed", "succeeded", "success"}:
                 if normalized_state in {"failed", "error", "cancelled"}:
+                    error_message, provider_error = _native_status_provider_error(status.raw)
                     return _native_provider_failure(
                         media_type=media_type,
                         provider_payload=provider_payload,
                         error_code="provider_generation_failed",
+                        error_message=error_message,
+                        provider_error=provider_error,
                         audit=audit,
                         reference_asset_ids=_native_reference_asset_ids(provider_payload),
                     )
@@ -1461,10 +1467,13 @@ class V2ProviderExecutor:
             error_code = str(error)
             if error_code not in _NATIVE_PROVIDER_ERROR_CODES:
                 error_code = "provider_generation_failed"
+            gateway_message, provider_error = _gateway_error_passthrough(error)
             return _native_provider_failure(
                 media_type=media_type,
                 provider_payload=provider_payload,
                 error_code=error_code,
+                error_message=gateway_message,
+                provider_error=provider_error,
                 audit=audit,
                 reference_asset_ids=_native_reference_asset_ids(provider_payload),
             )
@@ -2723,8 +2732,14 @@ def _native_provider_failure(
     error_message: str | None = None,
     audit: Mapping[str, object] | None = None,
     reference_asset_ids: list[str] | None = None,
+    provider_error: Mapping[str, Any] | None = None,
 ) -> V2ProviderResult:
     safe_audit = dict(audit or {})
+    metadata: dict[str, Any] = (
+        _native_result_metadata(safe_audit, "") if safe_audit else {"stage": "native_adapter"}
+    )
+    if provider_error:
+        metadata["native_provider_error"] = dict(provider_error)
     return V2ProviderResult(
         status="failed",
         media_type=media_type,
@@ -2734,10 +2749,39 @@ def _native_provider_failure(
         reference_asset_ids=reference_asset_ids or _native_reference_asset_ids(provider_payload),
         error_code=error_code,
         error_message=error_message or error_code,
-        metadata=(
-            _native_result_metadata(safe_audit, "") if safe_audit else {"stage": "native_adapter"}
-        ),
+        metadata=metadata,
     )
+
+
+def _provider_error_passthrough(
+    code: object,
+    message: object,
+) -> tuple[str | None, dict[str, Any]]:
+    """Return the bounded passthrough text and audit payload for a provider error."""
+
+    if not isinstance(code, str) or not code.strip():
+        return None, {}
+    bounded_code = code.strip()[:200]
+    bounded_message = message.strip()[:2_000] if isinstance(message, str) else ""
+    passthrough = {"code": bounded_code, "message": bounded_message}
+    text = f"Provider gateway error {bounded_code}: {bounded_message}".rstrip(": ").strip()
+    return (text or None), passthrough
+
+
+def _gateway_error_passthrough(error: ValueError) -> tuple[str | None, dict[str, Any]]:
+    """Surface a transport-raised gateway error code and message verbatim."""
+
+    code = getattr(error, "gateway_code", None)
+    message = getattr(error, "gateway_message", None)
+    if not isinstance(code, str):
+        return None, {}
+    return _provider_error_passthrough(code, message)
+
+
+def _native_status_provider_error(status_raw: Mapping[str, object]) -> tuple[str | None, dict[str, Any]]:
+    """Surface the error fields a native poll status carried from the provider."""
+
+    return _provider_error_passthrough(status_raw.get("error_code"), status_raw.get("message"))
 
 
 def _provider_output_reference_wire_audit(output: dict[str, Any]) -> dict[str, dict[str, Any]]:

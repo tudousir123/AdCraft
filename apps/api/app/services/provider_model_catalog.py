@@ -383,6 +383,62 @@ _MINIMAX_VIDEO_PROFILES = {
 }
 
 
+def _minimax_h3_video_profile(model_ref: str, provider_model_id: str) -> dict[str, Any]:
+    return _adapter_profile(
+        model_ref=model_ref,
+        adapter_id="minimax-video-native",
+        transport_kind="minimax_video_native",
+        capability="video",
+        request_mode="video_generation",
+        accepted_input_modes=("text_only", "text_plus_single_first_frame_image"),
+        max_images=1,
+        allowed_roles=("storyboard", "scene_reference", "character_turnaround"),
+        parameter_schema_id="minimax-h3-videos-v1",
+        result_protocol="async_file",
+        supports_remote_task_lookup=True,
+        supports_provider_idempotency=False,
+        conformance_status="compatible",
+        adapter_revision="minimax-video-native-v2",
+        capability_revision=f"{model_ref.replace(':', '-')}-videos-v1",
+        parameter_matrix=_parameter_matrix(
+            schema_id="minimax-h3-videos-v1",
+            descriptors=(
+                {
+                    "name": "duration_seconds",
+                    "value_type": "integer",
+                    "minimum": 4,
+                    "maximum": 15,
+                    "default": 5,
+                },
+                {
+                    "name": "resolution",
+                    "value_type": "enum",
+                    "allowed_values": ("720p",),
+                    "default": "720p",
+                },
+                {
+                    "name": "aspect_ratio",
+                    "value_type": "enum",
+                    "allowed_values": ("21:9", "16:9", "4:3", "1:1", "3:4", "9:16"),
+                    "default": "16:9",
+                },
+                {
+                    "name": "generate_audio",
+                    "value_type": "boolean",
+                    "default": True,
+                },
+            ),
+        ),
+    )
+
+
+_MINIMAX_H3_PROVIDER_MODEL_ID = "minimax/h3"
+_MINIMAX_H3_VIDEO_PROFILE = _minimax_h3_video_profile(
+    f"minimax:{_MINIMAX_H3_PROVIDER_MODEL_ID}",
+    _MINIMAX_H3_PROVIDER_MODEL_ID,
+)
+
+
 def _video_capability_metadata(
     profile: Mapping[str, Any],
     *,
@@ -702,6 +758,37 @@ _TRUSTED_MANIFESTS = (
             "conformance_status": "unverified",
             "adapter_profile": dict(_OPENROUTER_TEXT_PROFILE),
             "openrouter_routing": _OPENROUTER_TEXT_ROUTING.model_dump(mode="json"),
+        },
+    ),
+    TrustedModelManifest(
+        provider_id="minimax",
+        provider_model_id=_MINIMAX_H3_PROVIDER_MODEL_ID,
+        display_name="MiniMax H3",
+        capability="video",
+        capability_metadata={
+            "accepted_input_types": ["text", "image"],
+            "max_references": 1,
+            "reference_limits": {"image": 1, "video": 0, "audio": 0},
+            "supported_parameters": [
+                "aspect_ratio",
+                "resolution",
+                "duration_seconds",
+                "generate_audio",
+            ],
+            "supported_aspect_ratios": ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"],
+            "supported_resolutions": ["720p"],
+            "duration_range_seconds": [4, 15],
+            "supports_native_audio": True,
+            "default_parameters": {
+                "duration_seconds": 5,
+                "resolution": "720p",
+                "aspect_ratio": "16:9",
+                "generate_audio": True,
+            },
+            "provider_protocol": "minimax_video_generation",
+            "supports_provider_idempotency_token": False,
+            "supports_remote_task_lookup": True,
+            "adapter_profile": dict(_MINIMAX_H3_VIDEO_PROFILE),
         },
     ),
     TrustedModelManifest(

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from threading import Lock
 
 from app.core.config import PROJECT_ROOT, Settings
-from app.persistence.provider_model_repository import ProviderModelRepository
+from app.persistence.provider_model_repository import (
+    ModelDefaultRecord,
+    ProviderModelRepository,
+)
 from app.services.provider_credentials import (
     DotenvCredentialStore,
     ProviderConnectionService,
@@ -22,6 +26,8 @@ _BOOTSTRAP_LOCK = Lock()
 _ARK_MINI_TEXT_MODEL_REF = "volcengine_ark:doubao-seed-2-0-mini-260428"
 _ARK_PRO_TEXT_MODEL_REF = "volcengine_ark:doubao-seed-2-1-pro-260628"
 _FALLBACK_IMAGE_MODEL_REF = "volcengine_ark:doubao-seedream-5-0-lite-260128"
+_ARK_VIDEO_MODEL_REF = "volcengine_ark:doubao-seedance-2-0-fast-260128"
+_MINIMAX_H3_VIDEO_MODEL_REF = "minimax:minimax/h3"
 
 
 @dataclass(frozen=True)
@@ -87,13 +93,14 @@ class ProviderModelBootstrapService:
         }
         valid_candidates: dict[str, str] = {}
         for key, model_ref in candidates.items():
-            try:
-                model = self._repository.get_model(model_ref)
-            except ValueError:
-                continue
-            if model.availability != "available":
-                continue
-            valid_candidates[key] = model_ref
+            if self._model_is_available(model_ref):
+                valid_candidates[key] = model_ref
+        if (
+            "video" not in existing
+            and "video" not in valid_candidates
+            and self._model_is_available(_ARK_VIDEO_MODEL_REF)
+        ):
+            valid_candidates["video"] = _ARK_VIDEO_MODEL_REF
         migrated_defaults: dict[str, str] = {}
         try:
             ark_pro = catalog.get_model(_ARK_PRO_TEXT_MODEL_REF)
@@ -106,7 +113,11 @@ class ProviderModelBootstrapService:
                 if existing.get(key) is not None
                 and existing[key].model_ref == _ARK_MINI_TEXT_MODEL_REF
             }
-        default_updates = {**migrated_defaults, **valid_candidates}
+        default_updates = {
+            **migrated_defaults,
+            **valid_candidates,
+            **self._video_default_updates(existing),
+        }
         if default_updates:
             catalog.set_defaults(default_updates, now=now)
         return ProviderModelBootstrapResult(
@@ -134,7 +145,7 @@ class ProviderModelBootstrapService:
             "agent": text_ref,
             "text": text_ref,
             "image": self._image_default_model_ref(),
-            "video": "volcengine_ark:doubao-seedance-2-0-fast-260128",
+            "video": self._video_default_model_ref(),
             "audio": "tianpuyue:TemPolor-i3",
         }
 
@@ -151,3 +162,38 @@ class ProviderModelBootstrapService:
         if manifest is not None and manifest.provider_id == "volcengine_ark":
             return manifest.model_ref
         return _FALLBACK_IMAGE_MODEL_REF
+
+    def _video_default_model_ref(self) -> str:
+        """Prefer MiniMax H3 once its gateway credentials are configured."""
+
+        if self._minimax_video_credentials_ready():
+            return _MINIMAX_H3_VIDEO_MODEL_REF
+        return _ARK_VIDEO_MODEL_REF
+
+    def _minimax_video_credentials_ready(self) -> bool:
+        return bool(
+            (self._settings.minimax_api_key or "").strip()
+            and (self._settings.minimax_base_url or "").strip()
+        )
+
+    def _video_default_updates(self, existing: Mapping[str, ModelDefaultRecord]) -> dict[str, str]:
+        """Keep the video default on H3 while it stays available; fall back otherwise."""
+
+        current = existing.get("video")
+        if current is None:
+            return {}
+        h3_available = self._model_is_available(_MINIMAX_H3_VIDEO_MODEL_REF)
+        if current.model_ref == _MINIMAX_H3_VIDEO_MODEL_REF:
+            if h3_available or not self._model_is_available(_ARK_VIDEO_MODEL_REF):
+                return {}
+            return {"video": _ARK_VIDEO_MODEL_REF}
+        if current.model_ref == _ARK_VIDEO_MODEL_REF and h3_available:
+            return {"video": _MINIMAX_H3_VIDEO_MODEL_REF}
+        return {}
+
+    def _model_is_available(self, model_ref: str) -> bool:
+        try:
+            model = self._repository.get_model(model_ref)
+        except ValueError:
+            return False
+        return model.availability == "available"

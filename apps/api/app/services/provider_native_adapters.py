@@ -500,20 +500,7 @@ class OpenRouterImageAdapter(ProviderNativeAdapter):
         errors = super()._validate_references(references)
         if errors:
             return errors
-        for reference in references:
-            if reference.input_type == "image_url":
-                parsed = urlsplit(reference.value)
-                if parsed.scheme != "https" or not parsed.netloc or len(reference.value) > 8_192:
-                    return ("provider_reference_input_invalid",)
-            elif reference.input_type == "data_url":
-                if (
-                    not reference.value.startswith("data:image/")
-                    or len(reference.value) > 8_000_000
-                ):
-                    return ("provider_reference_input_invalid",)
-            else:
-                return ("provider_reference_input_invalid",)
-        return ()
+        return _validate_image_references(references)
 
     def submit(self, request: NativeProviderRequest) -> ProviderSubmission:
         transport = self._require_transport()
@@ -549,120 +536,243 @@ class OpenRouterImageAdapter(ProviderNativeAdapter):
         )
 
 
-class MiniMaxVideoAdapter(ProviderNativeAdapter):
-    """Project first-frame image-to-video requests into MiniMax task payloads."""
+_MINIMAX_VIDEO_ASPECT_RATIO_SIZES: Mapping[str, str] = {
+    "21:9": "1536x672",
+    "16:9": "1344x768",
+    "4:3": "1024x768",
+    "1:1": "768x768",
+    "3:4": "768x1024",
+    "9:16": "768x1344",
+}
+_MINIMAX_VIDEO_MAX_BYTES = 100 * 1024 * 1024
+_MINIMAX_VIDEO_MAX_B64_CHARS = 140_000_000
+
+
+class MiniMaxGatewayHttpError(ValueError):
+    """Gateway HTTP failure carrying the provider's original error payload."""
+
+    def __init__(self, *, status_code: int, code: str, message: str) -> None:
+        super().__init__("provider_request_failed")
+        self.status_code = status_code
+        self.gateway_code = code
+        self.gateway_message = message
+
+
+class MiniMaxVideoTransport:
+    """Async transport for an OpenAI-Videos compatible MiniMax gateway.
+
+    The gateway rejects unknown request fields, so only the frozen payload
+    compiled by the adapter is ever submitted.  Content is fetched with an
+    authenticated GET and inlined as a data URL; the content URL itself is
+    constructed from the task id and never surfaced in results.
+    """
 
     def __init__(
         self,
+        settings: Settings,
         *,
-        provider_model_id: str | None = None,
+        http_transport: ProviderHttpTransport | None = None,
+    ) -> None:
+        self._api_key = (settings.minimax_api_key or "").strip()
+        self._base_url = (settings.minimax_base_url or "").strip().rstrip("/")
+        self._http = http_transport or UrllibProviderHttpTransport()
+
+    def submit(self, payload: Mapping[str, object]) -> Mapping[str, object]:
+        self._require_configuration()
+        response = self._http.post_json(
+            url=f"{self._base_url}/videos",
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+            },
+            payload=dict(payload),
+            timeout_seconds=120.0,
+            max_response_bytes=1_000_000,
+        )
+        parsed = _minimax_json_body(response.body)
+        if not _minimax_success(response.status_code):
+            raise _minimax_gateway_error(response.status_code, parsed)
+        task_id = parsed.get("id") if parsed is not None else None
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise ValueError("provider_response_contract_invalid")
+        return {"task_id": task_id.strip()}
+
+    def poll(self, provider_task_id: str) -> Mapping[str, object]:
+        self._require_configuration()
+        response = self._http.get(
+            url=f"{self._base_url}/videos/{provider_task_id}",
+            headers={"Authorization": f"Bearer {self._api_key}"},
+            timeout_seconds=30.0,
+            max_response_bytes=1_000_000,
+        )
+        parsed = _minimax_json_body(response.body)
+        if not _minimax_success(response.status_code):
+            raise _minimax_gateway_error(response.status_code, parsed)
+        status = parsed.get("status") if parsed is not None else None
+        if not isinstance(status, str) or not status.strip():
+            raise ValueError("provider_response_contract_invalid")
+        result: dict[str, object] = {"status": status.strip().lower()}
+        error = parsed.get("error") if parsed is not None else None
+        if isinstance(error, Mapping):
+            code = error.get("code")
+            message = error.get("message")
+            if isinstance(code, str) and code.strip():
+                result["error_code"] = code.strip()[:200]
+            if isinstance(message, str) and message.strip():
+                result["message"] = message.strip()[:4_000]
+        return result
+
+    def download(self, provider_task_id: str) -> Mapping[str, object]:
+        self._require_configuration()
+        response = self._http.get(
+            url=f"{self._base_url}/videos/{provider_task_id}/content",
+            headers={"Authorization": f"Bearer {self._api_key}"},
+            timeout_seconds=300.0,
+            max_response_bytes=_MINIMAX_VIDEO_MAX_BYTES + 1,
+        )
+        if not _minimax_success(response.status_code):
+            raise _minimax_gateway_error(response.status_code, _minimax_json_body(response.body))
+        content = response.body
+        if not content or len(content) > _MINIMAX_VIDEO_MAX_BYTES:
+            raise ValueError("provider_response_contract_invalid")
+        if len(content) < 12 or content[4:8] != b"ftyp":
+            raise ValueError("provider_response_contract_invalid")
+        encoded = base64.b64encode(content).decode("ascii")
+        return {
+            "value": f"data:video/mp4;base64,{encoded}",
+            "mime_type": "video/mp4",
+            "decoded_size": len(content),
+        }
+
+    def _require_configuration(self) -> None:
+        if not self._api_key or not self._base_url:
+            raise ValueError("provider_configuration_missing")
+        parsed = urlsplit(self._base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("provider_base_url_invalid")
+
+
+def _minimax_success(status_code: int) -> bool:
+    return 200 <= status_code < 300
+
+
+def _minimax_json_body(body: bytes) -> Mapping[str, object] | None:
+    try:
+        parsed = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, Mapping) else None
+
+
+def _minimax_gateway_error(
+    status_code: int,
+    parsed: Mapping[str, object] | None,
+) -> MiniMaxGatewayHttpError:
+    code = ""
+    message = ""
+    error = parsed.get("error") if parsed is not None else None
+    if isinstance(error, Mapping):
+        raw_code = error.get("code")
+        raw_message = error.get("message")
+        code = str(raw_code).strip() if raw_code is not None else ""
+        message = str(raw_message).strip() if raw_message is not None else ""
+    if not code:
+        code = f"http_{status_code}"
+    if not message and parsed is not None:
+        fallback = parsed.get("message")
+        if isinstance(fallback, str):
+            message = fallback.strip()
+    if not message:
+        message = f"MiniMax gateway returned HTTP {status_code}."
+    return MiniMaxGatewayHttpError(
+        status_code=status_code,
+        code=code[:200],
+        message=message[:4_000],
+    )
+
+
+class MiniMaxVideoAdapter(ProviderNativeAdapter):
+    """Project canonical video requests into OpenAI-Videos gateway payloads."""
+
+    _DEFAULT_DURATION_SECONDS = 5
+    _DEFAULT_ASPECT_RATIO = "16:9"
+
+    def __init__(
+        self,
+        profile: ProviderAdapterProfileV1,
+        *,
         transport: NativeProviderTransport | None = None,
     ) -> None:
         super().__init__(transport=transport)
-        if provider_model_id is not None:
-            self._profile_for_model = self._profile_for_provider_model(provider_model_id)
-        else:
-            self._profile_for_model = None
-
-    @property
-    def effective_profile(self) -> ProviderAdapterProfileV1:
-        return self._profile_for_model or self.profile
-
-    @property
-    def active_profile(self) -> ProviderAdapterProfileV1:
-        return self.effective_profile
-
-    profile = ProviderAdapterProfileV1(
-        model_ref="minimax:MiniMax-Hailuo-2.3",
-        adapter_id="minimax-video-native",
-        transport_kind="minimax_video_native",
-        capability="video",
-        request_mode="video_generation",
-        accepted_input_modes=("text_only", "text_plus_single_first_frame_image"),
-        reference_policy=ReferenceInputPolicyV1(
-            modes=(
-                ReferenceInputModeV1(mode="text_only", max_references=0),
-                ReferenceInputModeV1(
-                    mode="text_plus_single_first_frame_image",
-                    max_references=1,
-                    allowed_roles=("storyboard", "scene_reference", "character_turnaround"),
-                ),
-            ),
-            max_images=1,
-        ),
-        parameter_schema_id="minimax-hailuo-i2v-v1",
-        parameter_matrix=ModelParameterMatrixV1(
-            schema_id="minimax-hailuo-i2v-v1",
-            revision="minimax-hailuo-i2v-v1",
-            descriptors=(
-                ModelParameterDescriptorV1(
-                    name="duration",
-                    value_type="integer",
-                    minimum=6,
-                    maximum=10,
-                ),
-                ModelParameterDescriptorV1(
-                    name="resolution",
-                    value_type="enum",
-                    allowed_values=("768P", "1080P"),
-                ),
-                ModelParameterDescriptorV1(
-                    name="aspect_ratio",
-                    value_type="enum",
-                    allowed_values=("16:9", "9:16", "1:1"),
-                ),
-                ModelParameterDescriptorV1(name="generate_audio", value_type="boolean"),
-            ),
-            legal_combinations=(
-                {"duration": 6, "resolution": "768P"},
-                {"duration": 6, "resolution": "1080P"},
-                {"duration": 10, "resolution": "768P"},
-                {"duration": 10, "resolution": "1080P"},
-            ),
-        ),
-        result_protocol="async_file",
-        supports_remote_task_lookup=True,
-        supports_provider_idempotency=True,
-        release_tier="optional",
-        conformance_status="unverified",
-        adapter_revision="minimax-video-native-v1",
-        capability_revision="minimax-hailuo-i2v-v1",
-    )
-
-    _MODELS = (
-        "MiniMax-Hailuo-2.3",
-        "MiniMax-Hailuo-2.3-Fast",
-        "MiniMax-Hailuo-02",
-    )
-
-    def _profile_for_provider_model(self, provider_model_id: str) -> ProviderAdapterProfileV1:
-        if provider_model_id not in self._MODELS:
-            raise ValueError("model_adapter_unavailable")
-        return self.profile.model_copy(
-            update={
-                "model_ref": f"minimax:{provider_model_id}",
-                "capability_revision": f"minimax-{provider_model_id}-i2v-v1",
-            }
-        )
+        if profile.transport_kind != "minimax_video_native":
+            raise ValueError("provider_adapter_profile_invalid")
+        self.profile = profile
 
     def _compile_payload(self, request: CanonicalProviderRequest) -> Mapping[str, object]:
         if len(request.references) > 1:
             raise ValueError("reference_count_exceeded")
+        aspect_ratio = self._effective_aspect_ratio(request.parameters)
         payload: dict[str, object] = {
             "model": request.provider_model_id,
             "prompt": request.prompt,
+            "seconds": self._effective_duration_seconds(request.parameters),
+            "size": _MINIMAX_VIDEO_ASPECT_RATIO_SIZES[aspect_ratio],
         }
-        payload.update(request.parameters)
         if request.references:
-            payload["first_frame_image"] = request.references[0].value
+            payload["input_reference"] = request.references[0].value
         return payload
 
-    def _validate_parameters(self, parameters: Mapping[str, object]) -> tuple[str, ...]:
-        return super()._validate_parameters(parameters)
+    def download(self, status: ProviderStatus) -> ProviderArtifact:
+        transport = self._require_transport()
+        response = transport.download(status.provider_task_id)
+        if not isinstance(response, Mapping) or set(response).difference(
+            {"value", "mime_type", "decoded_size"}
+        ):
+            raise ValueError("provider_response_contract_invalid")
+        value = response.get("value")
+        if not isinstance(value, str) or not value.startswith("data:video/mp4;base64,"):
+            raise ValueError("provider_response_contract_invalid")
+        if len(value) > _MINIMAX_VIDEO_MAX_B64_CHARS:
+            raise ValueError("provider_response_contract_invalid")
+        media_type = response.get("mime_type", "video/mp4")
+        if not isinstance(media_type, str) or media_type != "video/mp4":
+            raise ValueError("provider_response_contract_invalid")
+        try:
+            decoded = base64.b64decode(value.split(";base64,", 1)[1], validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise ValueError("provider_response_contract_invalid") from error
+        if not decoded or len(decoded) > _MINIMAX_VIDEO_MAX_BYTES:
+            raise ValueError("provider_response_contract_invalid")
+        if len(decoded) < 12 or decoded[4:8] != b"ftyp":
+            raise ValueError("provider_response_contract_invalid")
+        return ProviderArtifact(
+            media_type="video",
+            value=value,
+            provider_task_id=status.provider_task_id,
+            request_fingerprint=status.request_fingerprint,
+            raw={"mime_type": "video/mp4", "decoded_size": len(decoded)},
+        )
 
-    def normalize(self, artifact: ProviderArtifact) -> ProviderResult:
-        result = super().normalize(artifact)
-        return result
+    def _effective_duration_seconds(self, parameters: Mapping[str, object]) -> int:
+        raw = parameters.get("duration_seconds", self._DEFAULT_DURATION_SECONDS)
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            return self._DEFAULT_DURATION_SECONDS
+        return raw
+
+    def _effective_aspect_ratio(self, parameters: Mapping[str, object]) -> str:
+        raw = parameters.get("aspect_ratio", self._DEFAULT_ASPECT_RATIO)
+        if not isinstance(raw, str) or raw not in _MINIMAX_VIDEO_ASPECT_RATIO_SIZES:
+            raise ValueError("model_parameter_incompatible")
+        return raw
+
+    def _validate_references(
+        self,
+        references: tuple[CanonicalProviderReference, ...],
+    ) -> tuple[str, ...]:
+        errors = super()._validate_references(references)
+        if errors:
+            return errors
+        return _validate_image_references(references)
 
 
 class ArkMediaAdapter(ProviderNativeAdapter):
@@ -743,6 +853,22 @@ def _required_string(source: Mapping[str, object], *keys: str) -> str:
         if isinstance(value, str) and value.strip():
             return value
     raise ValueError("provider_response_contract_invalid")
+
+
+def _validate_image_references(
+    references: tuple[CanonicalProviderReference, ...],
+) -> tuple[str, ...]:
+    for reference in references:
+        if reference.input_type == "image_url":
+            parsed = urlsplit(reference.value)
+            if parsed.scheme != "https" or not parsed.netloc or len(reference.value) > 8_192:
+                return ("provider_reference_input_invalid",)
+        elif reference.input_type == "data_url":
+            if not reference.value.startswith("data:image/") or len(reference.value) > 8_000_000:
+                return ("provider_reference_input_invalid",)
+        else:
+            return ("provider_reference_input_invalid",)
+    return ()
 
 
 def _validate_parameter_matrix(

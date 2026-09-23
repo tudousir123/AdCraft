@@ -106,6 +106,7 @@ CANVAS_PROTOCOL_REFERENCE_DELIVERY_MODES: dict[str, frozenset[str]] = {
             "data_url",
         }
     ),
+    "minimax_video_generation": frozenset({"image_url", "data_url"}),
     "openai_compatible": frozenset(),
     "tianpuyue_audio": frozenset(),
 }

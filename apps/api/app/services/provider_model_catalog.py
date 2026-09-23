@@ -599,6 +599,34 @@ _TRUSTED_MANIFESTS = (
     ),
     TrustedModelManifest(
         provider_id="volcengine_ark",
+        provider_model_id="gpt-image-2.5-flare",
+        display_name="GPT Image 2.5 Flare",
+        capability="image",
+        capability_metadata={
+            "accepted_input_types": ["text", "image"],
+            "max_references": 4,
+            "reference_limits": {"image": 4, "video": 0, "audio": 0},
+            "supported_parameters": ["aspect_ratio", "size"],
+            "supported_aspect_ratios": ["1:1", "16:9", "9:16"],
+            "supported_sizes_by_aspect_ratio": {
+                "1:1": "1024x1024",
+                "16:9": "1536x1024",
+                "9:16": "1024x1536",
+            },
+            "size_enumeration": True,
+            "pixel_bounds": [1024, 1536],
+            "provider_protocol": "ark_image",
+            "supports_provider_idempotency_token": False,
+            "supports_remote_task_lookup": False,
+            "adapter_profile": _image_profile(
+                "volcengine_ark:gpt-image-2.5-flare",
+                adapter_id="ark-image-native",
+                transport_kind="ark_image_native",
+            ),
+        },
+    ),
+    TrustedModelManifest(
+        provider_id="volcengine_ark",
         provider_model_id="doubao-seedance-2-0-mini-260615",
         display_name="Doubao Seedance 2.0 Mini",
         capability="video",
@@ -858,6 +886,32 @@ _RETIRED_MODEL_REFS = frozenset(
 )
 _BLOCKING_RETIRED_DEFAULT_REFS = frozenset({"openai:gpt-image-2"})
 _CREDENTIAL_INDEPENDENT_SELECTION_REFS = frozenset({"openrouter:openai/gpt-image-2"})
+
+
+def trusted_manifest_for(
+    capability: str,
+    provider_model_id: str,
+) -> TrustedModelManifest | None:
+    """Find the built-in trusted manifest entry for one exact provider model."""
+
+    for manifest in _TRUSTED_MANIFESTS:
+        if manifest.capability == capability and manifest.provider_model_id == provider_model_id:
+            return manifest
+    return None
+
+
+def trusted_image_size_enumeration(provider_model_id: str) -> dict[str, str] | None:
+    """Return the closed aspect-ratio→size table a trusted image model enforces."""
+
+    manifest = trusted_manifest_for("image", provider_model_id)
+    if manifest is None:
+        return None
+    table = manifest.capability_metadata.get("supported_sizes_by_aspect_ratio")
+    if isinstance(table, Mapping) and table and manifest.capability_metadata.get(
+        "size_enumeration"
+    ):
+        return {str(ratio): str(size) for ratio, size in table.items()}
+    return None
 
 
 class StaticProviderCatalogAdapter:

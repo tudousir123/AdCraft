@@ -12,12 +12,16 @@ from app.services.provider_credentials import (
     ProviderConnectionService,
     ProviderCredentialRegistry,
 )
-from app.services.provider_model_catalog import ProviderModelCatalogService
+from app.services.provider_model_catalog import (
+    ProviderModelCatalogService,
+    trusted_manifest_for,
+)
 
 
 _BOOTSTRAP_LOCK = Lock()
 _ARK_MINI_TEXT_MODEL_REF = "volcengine_ark:doubao-seed-2-0-mini-260428"
 _ARK_PRO_TEXT_MODEL_REF = "volcengine_ark:doubao-seed-2-1-pro-260628"
+_FALLBACK_IMAGE_MODEL_REF = "volcengine_ark:doubao-seedream-5-0-lite-260128"
 
 
 @dataclass(frozen=True)
@@ -129,7 +133,21 @@ class ProviderModelBootstrapService:
         return {
             "agent": text_ref,
             "text": text_ref,
-            "image": "volcengine_ark:doubao-seedream-5-0-lite-260128",
+            "image": self._image_default_model_ref(),
             "video": "volcengine_ark:doubao-seedance-2-0-fast-260128",
             "audio": "tianpuyue:TemPolor-i3",
         }
+
+    def _image_default_model_ref(self) -> str:
+        """Follow the configured image model to its trusted entry, with a fallback.
+
+        Only entries served by the image credential group's provider qualify, so
+        an IMAGE_GENERATION_MODEL naming another provider's model (or any
+        unrecognized name) keeps the historical default.
+        """
+
+        configured = self._settings.image_generation_model.strip()
+        manifest = trusted_manifest_for("image", configured)
+        if manifest is not None and manifest.provider_id == "volcengine_ark":
+            return manifest.model_ref
+        return _FALLBACK_IMAGE_MODEL_REF

@@ -8,6 +8,9 @@ SEEDANCE_MAX_SINGLE_TASK_DURATION_SECONDS = max(SEEDANCE_SINGLE_TASK_DURATIONS_S
 ARK_SEEDANCE_RESOLUTION = "480p"
 DEFAULT_VIDEO_RATIO = "16:9"
 SEEDREAM_MIN_IMAGE_PIXELS = 3_686_400
+# Gateway WAFs (e.g. Cloudflare) block the default "Python-urllib" fingerprint
+# with 403/1010, so outbound image-generation HTTP calls carry this agent.
+PROVIDER_HTTP_USER_AGENT = "AdCraft/1.0"
 
 
 class MediaConfigurationError(RuntimeError):

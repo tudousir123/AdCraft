@@ -13,7 +13,11 @@ from uuid import uuid4
 
 from app.core.config import Settings
 from app.schemas.seedance_inputs import SeedanceInputManifestV1
-from app.tools.media_provider_protocol import MediaConfigurationError
+from app.services.provider_model_catalog import trusted_image_size_enumeration
+from app.tools.media_provider_protocol import (
+    PROVIDER_HTTP_USER_AGENT,
+    MediaConfigurationError,
+)
 from app.tools.seedance_adapter import (
     DEFAULT_VIDEO_RATIO,
     VolcengineSeedanceAdapter,
@@ -144,6 +148,29 @@ def _is_video_file(path: Path) -> bool:
     except OSError:
         return False
     return len(header) >= 12 and header[4:8] == b"ftyp"
+
+
+def _resolve_enumerated_image_size(
+    enumerated_sizes: dict[str, str],
+    *,
+    requested_size: object,
+    requested_aspect_ratio: object,
+) -> str:
+    """Clamp one request onto a trusted model's closed size table.
+
+    Models with a closed table reject any other size upstream, so a stale or
+    unset size must never reach the gateway: an exact table match wins, then
+    the requested aspect ratio, then the square default.
+    """
+
+    if isinstance(requested_size, str) and requested_size.strip():
+        normalized = requested_size.strip().lower()
+        for size in enumerated_sizes.values():
+            if size.lower() == normalized:
+                return size
+    if isinstance(requested_aspect_ratio, str) and requested_aspect_ratio in enumerated_sizes:
+        return enumerated_sizes[requested_aspect_ratio]
+    return enumerated_sizes.get("1:1") or next(iter(enumerated_sizes.values()))
 
 
 def _content_length(response: Any) -> int | None:
@@ -515,12 +542,21 @@ class RealMediaProvider:
         reference_assets = [
             asset for asset in request.get("reference_assets", []) if isinstance(asset, dict)
         ]
+        enumerated_sizes = trusted_image_size_enumeration(model)
+        if enumerated_sizes is not None:
+            size = _resolve_enumerated_image_size(
+                enumerated_sizes,
+                requested_size=request.get("size"),
+                requested_aspect_ratio=request.get("aspect_ratio"),
+            )
+        else:
+            size = _normalize_image_generation_size(
+                request.get("size") or self._settings.image_generation_size
+            )
         body, wire_audit = serialize_volcengine_image_generation_request(
             model=model,
             canonical_prompt=prompt,
-            size=_normalize_image_generation_size(
-                request.get("size") or self._settings.image_generation_size
-            ),
+            size=size,
             references=reference_assets,
             required_reference_asset_ids=list(request.get("submitted_reference_asset_ids") or []),
             response_format="url",
@@ -766,6 +802,7 @@ class RealMediaProvider:
             headers={
                 "Authorization": f"Bearer {self._settings.image_generation_api_key}",
                 "Content-Type": "application/json",
+                "User-Agent": PROVIDER_HTTP_USER_AGENT,
             },
             method="POST",
         )
@@ -782,7 +819,8 @@ class RealMediaProvider:
 
     def _download_remote_file(self, url: str, output_path: Path) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        with urllib_request.urlopen(url, timeout=120) as response:
+        request = urllib_request.Request(url, headers={"User-Agent": PROVIDER_HTTP_USER_AGENT})
+        with urllib_request.urlopen(request, timeout=120) as response:
             output_path.write_bytes(response.read())
 
     def _download_remote_asset(

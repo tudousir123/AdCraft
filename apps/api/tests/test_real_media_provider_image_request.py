@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from urllib import request as urllib_request
@@ -11,14 +12,14 @@ from urllib import request as urllib_request
 import pytest
 
 from app.core.config import Settings
-from app.tools.media_provider_protocol import PROVIDER_HTTP_USER_AGENT
+from app.tools.media_provider_protocol import (
+    PROVIDER_HTTP_USER_AGENT,
+    MediaConfigurationError,
+)
 from app.tools.real_media_provider import RealMediaProvider
 
 FLARE_MODEL_ID = "gpt-image-2.5-flare"
-PNG_BYTES = (
-    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
-    + b"\x00" * 24
-)
+PNG_BYTES = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 24
 
 
 class _FakeResponse:
@@ -225,3 +226,17 @@ def test_non_enumerated_model_keeps_seedream_size_normalization(
     payload = transport.submitted_payload()
     assert payload["model"] == "doubao-seedream-5-0-lite-260128"
     assert payload["size"] == "2048x2048"
+
+
+def test_enumerated_image_model_bypasses_seedream_size_floor_at_construction(
+    media_data_dir: Path,
+) -> None:
+    flare = replace(_settings(media_data_dir), image_generation_size="1024x1024")
+    RealMediaProvider(flare)
+
+    seedream = replace(
+        _settings(media_data_dir, image_model="doubao-seedream-5-0-lite-260128"),
+        image_generation_size="1024x1024",
+    )
+    with pytest.raises(MediaConfigurationError):
+        RealMediaProvider(seedream)

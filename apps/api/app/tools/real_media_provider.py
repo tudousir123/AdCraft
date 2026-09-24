@@ -325,7 +325,8 @@ class RealMediaProvider:
                 "Real media mode is enabled, but COMPOSITION_ENDPOINT is missing."
             )
 
-        _normalize_image_generation_size(self._settings.image_generation_size)
+        if trusted_image_size_enumeration(self._settings.image_generation_model or "") is None:
+            _normalize_image_generation_size(self._settings.image_generation_size)
 
     # V1-only compatibility adapter; V2 image generation uses generate_v2_canonical_image.
     def generate_storyboard_images(
